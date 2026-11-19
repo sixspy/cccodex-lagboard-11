@@ -31,6 +31,9 @@
   input,select{width:100%;border:1px solid var(--line);border-radius:10px;padding:9px 10px;margin:5px 0 10px}
   .primary{background:var(--blue);color:#fff;border:0;border-radius:10px;padding:10px 12px;cursor:pointer}
   .ghost{background:#fff;border:1px solid #334155;color:#334155;border-radius:8px;padding:6px 8px;cursor:pointer}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:#e2e8f0;color:#334155}
+  .tag.ok{background:#d1fae5;color:#065f46}.tag.warn{background:#fef3c7;color:#92400e}.tag.bad{background:#fee2e2;color:#991b1b}
   .login{max-width:420px;margin:12vh auto;background:#fff;border:1px solid var(--line);border-radius:16px;padding:24px}
   .err{color:var(--bad);min-height:18px}
   .timeline{border-left:2px solid #cbd5e1;margin-left:8px;padding-left:14px}
@@ -58,12 +61,15 @@ createApp({
     const token=ref(localStorage.getItem('lagboard_token')||'');
     const user=ref(localStorage.getItem('lagboard_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
-    const sources=ref([]), arrivals=ref([]), catchups=ref([]);
+    const sources=ref([]), arrivals=ref([]), catchups=ref([]), ledger=ref([]);
     const form=ref({source:'订单源', source_clock:'2026-11-16T10:00:00', ingest_clock:'2026-11-16T10:40:00'});
-    const nav=['到达登记','滞后分级','补齐恢复'];
+    const nav=['到达登记','滞后分级','补齐恢复','升级审计'];
     const frozen=computed(()=>sources.value.filter(s=>s.output_mode==='冻结').length);
     const degraded=computed(()=>sources.value.filter(s=>s.output_mode==='降级只读').length);
+    const upgradeTraceCount=computed(()=>ledger.value.length);
     function modeClass(m){return m==='冻结'?'bad':(m==='降级只读'?'warn':'ok');}
+    function levelClass(l){return l==='违约'?'bad':(l==='告警'?'warn':'ok');}
+    function ledgerClass(r){return r==='成功'?'ok':(r==='等级升级争用'?'warn':'bad');}
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -88,6 +94,8 @@ createApp({
       arrivals.value=Array.isArray(a.items)?a.items:[];
       const c=await loadJson('/api/catchups'); if(c===null) return;
       catchups.value=Array.isArray(c.items)?c.items:[];
+      const u=await loadJson('/api/upgrade-ledger'); if(u===null) return;
+      ledger.value=Array.isArray(u.items)?u.items:[];
       if(sources.value.length && !form.value.source) form.value.source=sources.value[0].name;
     }
     async function recordArrival(){
@@ -97,8 +105,15 @@ createApp({
       await refresh();
     }
     async function doCatchup(name){await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});await refresh();}
+    async function doUpgrade(arrival){
+      actionErr.value='';
+      const r=await fetch('/api/arrivals/'+arrival.id+'/upgrade',{method:'POST',headers:auth()});
+      const j=await r.json().catch(()=>({}));
+      actionErr.value=r.ok?(`到达 #${j.arrival_id} 已${j.from_level}升${j.to_level} · 源目录连坐${j.output_mode}`):(j.detail||'升级失败');
+      await refresh();
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
+    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,ledger,form,actionErr,frozen,degraded,upgradeTraceCount,modeClass,levelClass,ledgerClass,login,logout,recordArrival,doCatchup,doUpgrade};
   },
   template:`
   <div v-if="!token" class="login">
@@ -110,7 +125,7 @@ createApp({
   <div v-if="token" class="wrap">
     <aside>
       <h1>源到达SLA</h1>
-      <p>左侧是各源当前输出态；右侧登记到达并做补齐恢复。</p>
+      <p>左侧是各源当前输出态（源目录）；右侧登记到达并做补齐恢复。</p>
       <div class="src" v-for="s in sources" :key="s.id">
         <b>{{s.name}}</b>
         <span>SLA {{s.sla_minutes}} 分钟</span>
@@ -122,10 +137,12 @@ createApp({
       <div class="bar">
         <div class="seg"><button v-for="(n,i) in nav" :key="n" :class="{on:tab===i}" @click="tab=i">{{n}}</button></div>
       </div>
+      <div style="font-size:12px;color:#64748b;margin-bottom:6px">水位卡片（与源目录、策略附页、到达详情、升级审计同态）</div>
       <div class="cards">
         <div class="card"><h3>源数量</h3><strong>{{sources.length}}</strong></div>
         <div class="card"><h3>冻结中</h3><strong>{{frozen}}</strong></div>
         <div class="card"><h3>降级只读</h3><strong>{{degraded}}</strong></div>
+        <div class="card"><h3>升级留痕</h3><strong>{{upgradeTraceCount}}</strong></div>
       </div>
       <div class="card" v-show="tab===0">
         <h3 style="margin-bottom:8px">登记到达</h3>
@@ -138,24 +155,44 @@ createApp({
         <div class="err">{{actionErr}}</div>
         <div class="timeline" style="margin-top:16px">
           <div class="item" v-for="a in (arrivals||[]).slice(0,8)" :key="a.id">
-            <b>{{a.source}}</b> · 滞后 {{a.lag_minutes}} 分 · {{a.level}}
+            <b>#{{a.id}} {{a.source}}</b> · 滞后 {{a.lag_minutes}} 分 · <span class="tag" :class="levelClass(a.level)">{{a.level}}</span>
             <div style="color:#64748b;font-size:12px">{{a.source_clock}} → {{a.ingest_clock}}</div>
           </div>
         </div>
       </div>
       <div class="card" v-show="tab===1">
-        <h3>分级规则</h3>
-        <p style="color:#64748b;font-size:13px">≤SLA 正常可写；≤2×SLA 告警降级只读；更久违约冻结。</p>
+        <h3>策略附页 · 分级规则与等级升级入口</h3>
+        <p style="color:#64748b;font-size:13px">≤SLA 正常可写；≤2×SLA 告警降级只读；更久违约冻结。等级升级仅许可「告警升违约」，走甲路径同库一次提交，连坐源输出态冻结，见 <code>docs/等级升级说明_封存.md</code>。</p>
         <table><thead><tr><th>源</th><th>SLA</th><th>输出态</th><th></th></tr></thead>
         <tbody><tr v-for="s in sources" :key="'g'+s.id">
           <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>{{s.output_mode}}</td>
           <td><button class="ghost" @click="doCatchup(s.name)">补齐恢复</button></td>
         </tr></tbody></table>
+        <h3 style="margin:16px 0 8px">告警到达升级（告警 → 违约，连坐冻结）</h3>
+        <table><thead><tr><th>到达主键</th><th>源</th><th>滞后(分)</th><th>当前等级</th><th>操作</th></tr></thead>
+        <tbody><tr v-for="a in arrivals" :key="'u'+a.id">
+          <td>#{{a.id}}</td><td>{{a.source}}</td><td>{{a.lag_minutes}}</td>
+          <td><span class="tag" :class="levelClass(a.level)">{{a.level}}</span></td>
+          <td><button class="primary" :disabled="a.level!=='告警'" @click="doUpgrade(a)">升违约并连坐冻结</button></td>
+        </tr></tbody></table>
+        <div class="err">{{actionErr}}</div>
       </div>
       <div class="card" v-show="tab===2">
         <h3>补齐记录</h3>
         <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>时间</th></tr></thead>
         <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+      </div>
+      <div class="card" v-show="tab===3">
+        <h3>升级审计 · 升级专册</h3>
+        <p style="color:#64748b;font-size:13px">甲路径同库一次提交；后交只记「等级升级争用」，偏离说明记「升级偏了」。</p>
+        <table><thead><tr><th>账本</th><th>到达主键</th><th>源</th><th>等级变化</th><th>结果</th><th>说明</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="u in ledger" :key="'l'+u.id">
+          <td>#{{u.id}}</td><td>#{{u.arrival_id}}</td><td>{{u.source}}</td>
+          <td>{{u.from_level}} → {{u.to_level}}</td>
+          <td><span class="tag" :class="ledgerClass(u.result)">{{u.result}}</span></td>
+          <td style="color:#64748b">{{u.note}}</td><td>{{u.created_at}}</td>
+        </tr></tbody></table>
+        <p v-if="!ledger.length" style="color:#94a3b8;font-size:13px">暂无升级留痕。</p>
       </div>
     </main>
   </div>`

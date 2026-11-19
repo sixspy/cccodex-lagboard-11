@@ -1,5 +1,5 @@
 
-import hashlib, secrets, sqlite3
+import hashlib, secrets, sqlite3, threading
 from pathlib import Path
 from fastapi import Header, HTTPException
 from pydantic import BaseModel
@@ -9,10 +9,27 @@ DATA = ROOT / "data"
 DB_PATH = DATA / "app.db"
 FRONTEND = ROOT / "frontend"
 SESSIONS: dict[str, str] = {}
+# 升级故障注入开关（仅测试用）：为真时甲路径事务在提交前抛错，整笔撤回
+UPGRADE_FAULT = False
+# 持锁关键区钩子（仅测试用）：默认空操作，测试可替换为同步事件以确定性制造争用窗口
+UPGRADE_LOCK_HELD_HOOK = lambda: None
+# 升级锁（进程内，按源互斥）：双路同点同一源时后交者只能记“等级升级争用”
+_UPGRADE_LOCKS_GUARD = threading.Lock()
+_UPGRADE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def upgrade_lock_for(source: str) -> threading.Lock:
+    with _UPGRADE_LOCKS_GUARD:
+        lk = _UPGRADE_LOCKS.get(source)
+        if lk is None:
+            lk = threading.Lock()
+            _UPGRADE_LOCKS[source] = lk
+        return lk
+
 
 def connect():
     DATA.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -74,6 +91,21 @@ def init_db():
           status TEXT NOT NULL,
           restored_mode TEXT NOT NULL,
           note TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS upgrade_ledger(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          arrival_id INTEGER NOT NULL,
+          source TEXT NOT NULL,
+          from_level TEXT NOT NULL,
+          to_level TEXT NOT NULL,
+          result TEXT NOT NULL,
+          note TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS upgrade_locks(
+          source TEXT PRIMARY KEY,
+          holder TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
         """)
@@ -163,6 +195,89 @@ def catchups(authorization: str | None = Header(default=None)):
     require_user(authorization)
     with connect() as c:
         return {"items":[dict(r) for r in c.execute("SELECT * FROM catchups ORDER BY id DESC").fetchall()]}
+
+def _write_ledger(conn, arrival_id, source, from_level, to_level, result, note, now):
+    conn.execute(
+        "INSERT INTO upgrade_ledger(arrival_id,source,from_level,to_level,result,note,created_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (arrival_id, source, from_level, to_level, result, note, now))
+
+@app.post("/api/arrivals/{arrival_id}/upgrade")
+def upgrade_arrival(arrival_id: int, authorization: str | None = Header(default=None)):
+    """告警升违约连坐改态（甲路径）：违约等级与源输出态、升级账本同库一次提交，遇错全部撤回。"""
+    username = require_user(authorization)
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = connect()
+    try:
+        row = conn.execute("SELECT * FROM arrivals WHERE id=?", (arrival_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "未知到达")
+        source, current_level = row["source"], row["level"]
+
+        # 先占升级锁：双路同点同一源，后交者只记争用，不做任何改态
+        lk = upgrade_lock_for(source)
+        if not lk.acquire(blocking=False):
+            _write_ledger(conn, arrival_id, source, current_level, current_level,
+                          "等级升级争用", f"{username} 后交，升级锁被占用", now)
+            conn.commit()
+            raise HTTPException(409, "等级升级争用：同源升级正在处理，后交仅记争用")
+        # 持锁关键区钩子（测试可注入等待，确定性覆盖争用窗口；生产为空操作）
+        UPGRADE_LOCK_HELD_HOOK()
+        try:
+            # 持久升级锁：同库留痕，跨进程同样互斥
+            try:
+                conn.execute("INSERT INTO upgrade_locks(source,holder,created_at) VALUES (?,?,?)",
+                             (source, username, now))
+                conn.commit()
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                _write_ledger(conn, arrival_id, source, current_level, current_level,
+                              "等级升级争用", f"{username} 后交，持久升级锁被占用", now)
+                conn.commit()
+                raise HTTPException(409, "等级升级争用：持久升级锁被占用，后交仅记争用")
+            try:
+                latest = conn.execute("SELECT * FROM arrivals WHERE id=?", (arrival_id,)).fetchone()
+                # 升级说明只许可“告警 -> 违约”，其余一律判升级偏了并驳回
+                if latest["level"] != "告警":
+                    note = "升级偏了：仅允许告警升违约"
+                    _write_ledger(conn, arrival_id, source, latest["level"], latest["level"],
+                                  "升级偏了", note, now)
+                    conn.commit()
+                    raise HTTPException(409, note)
+
+                # 甲路径：等级、源输出态、成功账本三笔写在同一事务，一次提交
+                conn.execute("UPDATE arrivals SET level='违约' WHERE id=?", (arrival_id,))
+                conn.execute("UPDATE sources SET output_mode='冻结' WHERE name=?", (source,))
+                _write_ledger(conn, arrival_id, source, "告警", "违约", "成功",
+                              f"{username} 告警升违约，连坐输出态冻结（甲路径同库一次提交）", now)
+                if UPGRADE_FAULT:
+                    raise RuntimeError("注入的升级写路径故障")
+                conn.commit()
+                return {"ok": True, "result": "成功", "arrival_id": arrival_id, "source": source,
+                        "from_level": "告警", "to_level": "违约", "output_mode": "冻结"}
+            except HTTPException:
+                raise
+            except Exception:
+                # 遇错全部撤回：等级改口、目录冻结、成功账本一并作废，正式零改
+                conn.rollback()
+                raise HTTPException(500, "等级升级失败，已全部撤回")
+        finally:
+            # 释放持久升级锁与进程内升级锁
+            try:
+                conn.execute("DELETE FROM upgrade_locks WHERE source=?", (source,))
+                conn.commit()
+            except sqlite3.Error:
+                conn.rollback()
+            lk.release()
+    finally:
+        conn.close()
+
+@app.get("/api/upgrade-ledger")
+def upgrade_ledger(authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    with connect() as c:
+        return {"items":[dict(r) for r in c.execute(
+            "SELECT * FROM upgrade_ledger ORDER BY id DESC").fetchall()]}
 
 @app.get("/")
 def index():
